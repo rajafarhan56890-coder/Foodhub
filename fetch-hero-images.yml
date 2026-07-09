@@ -1,0 +1,35 @@
+name: Fetch hero images
+
+# Runs automatically the first time you push, and any time you re-run it
+# manually from the Actions tab. It downloads the 4 real product photos
+# straight into assets/images/hero/ and commits them to your repo — so you
+# never have to download anything by hand.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fetch-images:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download hero photos (Pexels, free license, no attribution required)
+        run: |
+          mkdir -p assets/images/hero
+          curl -sL "https://images.pexels.com/photos/3220617/pexels-photo-3220617.jpeg?auto=compress&cs=tinysrgb&w=1600" -o assets/images/hero/burger.jpg
+          curl -sL "https://images.pexels.com/photos/803290/pexels-photo-803290.jpeg?auto=compress&cs=tinysrgb&w=1600" -o assets/images/hero/pizza.jpg
+          curl -sL "https://images.pexels.com/photos/4109234/pexels-photo-4109234.jpeg?auto=compress&cs=tinysrgb&w=1600" -o assets/images/hero/fries.jpg
+          curl -sL "https://images.pexels.com/photos/7837671/pexels-photo-7837671.jpeg?auto=compress&cs=tinysrgb&w=1600" -o assets/images/hero/pasta.jpg
+
+      - name: Commit images if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add assets/images/hero/*.jpg
+          git diff --staged --quiet && echo "No changes to commit" || git commit -m "Add hero slider photos (automated)"
+          git push
