@@ -1,0 +1,232 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    /* ---------- helpers ---------- */
+    function isAdmin() {
+      return request.auth != null &&
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+
+    function isNonEmptyString(v, maxLen) {
+      return v is string && v.size() > 0 && v.size() <= maxLen;
+    }
+
+    /* ---------- users: customer account profiles (owner-only) ----------
+       Created by the storefront's real Firebase Authentication sign-up flow.
+       Holds the extra profile fields (name, phone, photoURL, and mirrored
+       emailVerified/phoneVerified flags) that Firebase Auth's email/password
+       provider itself has no field for. Strictly owner-only — nobody,
+       including other signed-in customers, can read or write another
+       user's profile document.
+       Note: emailVerified/phoneVerified here are a convenience mirror for
+       display purposes only — no gating logic in the app trusts these
+       Firestore fields over Firebase Auth's own emailVerified/phoneNumber,
+       which the client can't forge, so validating them as booleans (rather
+       than trying to re-derive "real" verification state in a rule) is
+       sufficient.
+
+       IMPORTANT: this used to be one combined `allow write` requiring name
+       AND email to be non-empty strings on every single write. That's why
+       profile edits were silently failing: updateProfileInfo() only ever
+       sends { name } and/or { photoURL } via setDoc(..., {merge:true}) — it
+       never sends email — so that write could never satisfy an
+       unconditional isNonEmptyString(email) check. Below, each distinct
+       write shape the client actually performs gets its own narrowly scoped
+       rule instead, via affectedKeys(), so a name/photo edit is validated
+       against exactly {name, photoURL} and nothing else. */
+    match /users/{uid} {
+      allow read: if request.auth != null && (request.auth.uid == uid || isAdmin());
+
+      // Sign-up (see signUp() in index.html): { name, phone, email, createdAt }.
+      allow create: if request.auth != null && request.auth.uid == uid &&
+        isNonEmptyString(request.resource.data.name, 80) &&
+        isNonEmptyString(request.resource.data.email, 120) &&
+        (!('phone' in request.resource.data) || (request.resource.data.phone is string && request.resource.data.phone.size() <= 30));
+
+      // Profile edit (see updateProfileInfo() in index.html): the customer
+      // can update ONLY their own name and/or profile photo — nothing else,
+      // including email, is touchable through this rule.
+      allow update: if request.auth != null && request.auth.uid == uid &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'photoURL']) &&
+        (!('name' in request.resource.data) || isNonEmptyString(request.resource.data.name, 80)) &&
+        (!('photoURL' in request.resource.data) || (request.resource.data.photoURL is string && request.resource.data.photoURL.size() <= 500));
+
+      // Phone verification (see verifyPhoneOtp() in index.html): { phone, phoneVerified: true }.
+      allow update: if request.auth != null && request.auth.uid == uid &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['phone', 'phoneVerified']) &&
+        request.resource.data.phone is string && request.resource.data.phone.size() <= 30 &&
+        request.resource.data.phoneVerified is bool;
+
+      // emailVerified/phoneVerified display mirror (see buildUserProfile()'s
+      // fire-and-forget sync in index.html): { emailVerified, phoneVerified }.
+      allow update: if request.auth != null && request.auth.uid == uid &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['emailVerified', 'phoneVerified']) &&
+        (!('emailVerified' in request.resource.data) || request.resource.data.emailVerified is bool) &&
+        (!('phoneVerified' in request.resource.data) || request.resource.data.phoneVerified is bool);
+
+      // Last-login stamp (see signIn() in index.html): { lastLoginAt }.
+      allow update: if request.auth != null && request.auth.uid == uid &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['lastLoginAt']) &&
+        request.resource.data.lastLoginAt is timestamp;
+
+      // Admin Panel's Users page: the ONLY thing an admin can ever change on
+      // someone else's profile is the disabled flag (Enable/Disable account)
+      // — enforced by affectedKeys() below. This can never touch name, email,
+      // phone, photo, or verification fields, which stay strictly owner-only.
+      allow update: if isAdmin() &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['disabled']) &&
+        request.resource.data.disabled is bool;
+    }
+
+    /* ---------- admins allow-list ----------
+       Docs here are created manually by you via the Firebase Console
+       (Firestore -> Data -> "admins" collection -> add a document whose
+       ID is the admin user's Auth UID). No client can ever write here. */
+    match /admins/{uid} {
+      allow get: if request.auth != null && request.auth.uid == uid;
+      allow list, create, update, delete: if false;
+    }
+
+    /* ---------- storefront catalog: public read, admin write ---------- */
+    match /categories/{categoryId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /products/{productId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /coupons/{code} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /settings/{docId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    /* ---------- reviews: public read, validated public create, admin moderate ---------- */
+    match /reviews/{reviewId} {
+      allow read: if true;
+      allow create: if
+        isNonEmptyString(request.resource.data.productId, 200) &&
+        isNonEmptyString(request.resource.data.name, 60) &&
+        isNonEmptyString(request.resource.data.comment, 500) &&
+        request.resource.data.rating is int &&
+        request.resource.data.rating >= 1 && request.resource.data.rating <= 5;
+      allow update, delete: if isAdmin();
+    }
+
+    /* ---------- orders: signed-in + verified-email create only, admin-only browse/manage ----------
+       `get` (fetching one exact document ID) is public so the storefront's
+       "Track Order Live" feature can subscribe to that customer's own order
+       — the doc ID is an unguessable Firestore auto-ID handed back only to
+       the browser that placed the order, similar to a private tracking link.
+       `list` (querying/browsing) is admin-only, or a customer's own
+       uid-filtered query (see below) — nobody can enumerate other
+       customers' orders. */
+    match /orders/{orderId} {
+      allow get: if true;
+      // Admin can list everything. A signed-in customer can also list, but
+      // ONLY when their query is itself already filtered to their own uid
+      // (e.g. the storefront's Profile > Order History: where('uid','==',
+      // uid)) — Firestore validates that every possible result of such a
+      // query satisfies resource.data.uid == request.auth.uid before
+      // allowing it, so an unfiltered or someone-else's-uid query is still
+      // rejected. This is what was silently breaking Order History before.
+      allow list: if isAdmin() || (request.auth != null && request.auth.uid == resource.data.uid);
+      // Orders require a signed-in account with a verified email — guest
+      // checkout is no longer supported. request.auth.token.email_verified
+      // comes straight from the Firebase Auth ID token, so it can't be
+      // forged by the client. uid on the order must match the caller's own
+      // uid, so nobody can create an order attributed to another account.
+      allow create: if
+        request.auth != null &&
+        request.auth.token.email_verified == true &&
+        request.resource.data.uid == request.auth.uid &&
+        isNonEmptyString(request.resource.data.orderNumber, 30) &&
+        request.resource.data.customer is map &&
+        isNonEmptyString(request.resource.data.customer.name, 80) &&
+        isNonEmptyString(request.resource.data.customer.phone, 30) &&
+        request.resource.data.items is list &&
+        request.resource.data.items.size() > 0 &&
+        request.resource.data.total is number &&
+        request.resource.data.status == 'Pending';
+      // Admin can update anything (status changes, etc). The order's own
+      // owner may also update it, but ONLY to attach their payment proof
+      // (paymentProof/paymentStatus) after choosing Easypaisa/JazzCash —
+      // affectedKeys() below guarantees they can't touch status, items,
+      // total, or anyone else's order.
+      allow update: if isAdmin() || (
+        request.auth != null &&
+        resource.data.uid == request.auth.uid &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['paymentProof', 'paymentStatus', 'updatedAt'])
+      );
+      allow delete: if isAdmin();
+    }
+
+    /* ---------- homepageSections: public read, admin write ----------
+       Drives the dynamic homepage rails (Trending, Popular, Chef's Special,
+       etc.) managed from the admin panel's Homepage Sections page. No
+       collection-specific field validation here (same light-touch pattern
+       as categories/products/coupons/settings above) since only an admin
+       can ever write it. */
+    match /homepageSections/{sectionId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    /* ---------- paymentProofs: owner-submitted, admin-managed ----------
+       Doc ID === the order's ID. Written by the customer who placed that
+       order (via submitPaymentProof after choosing Easypaisa/JazzCash),
+       verified against the order's own `uid` so nobody can submit a proof
+       for someone else's order. Admin reviews/deletes these from the
+       Admin Panel's payment-verification queue.
+
+       IMPORTANT: ownsOrder() used to call get(...).data.uid with no
+       exists() guard first. Per Firestore's documented rules behavior,
+       reading .data off a get() result throws (which surfaces to the
+       client as permission-denied) if the referenced document doesn't
+       exist — that's why proof submission could fail even though the order
+       itself was created successfully. Guarding with exists() first fixes
+       that. The write rule now also checks request.resource.data.uid ==
+       request.auth.uid directly against the uid the client now includes on
+       the proof itself (see submitPaymentProof() in index.html) — so
+       ownership is confirmed two ways: the order's actual owner (via the
+       guarded get()) AND the caller's own uid on the document being
+       written. Reads no longer need their own get(), since the proof
+       document carries its owner's uid directly. */
+    match /paymentProofs/{orderId} {
+      function ownsOrder() {
+        return request.auth != null &&
+          exists(/databases/$(database)/documents/orders/$(orderId)) &&
+          get(/databases/$(database)/documents/orders/$(orderId)).data.uid == request.auth.uid;
+      }
+      allow read: if isAdmin() || (request.auth != null && resource.data.uid == request.auth.uid);
+      allow create, update: if ownsOrder() &&
+        request.resource.data.uid == request.auth.uid &&
+        isNonEmptyString(request.resource.data.customerName, 80) &&
+        isNonEmptyString(request.resource.data.mobileNumber, 30) &&
+        isNonEmptyString(request.resource.data.transactionId, 100);
+      allow delete: if isAdmin();
+    }
+
+    /* ---------- customers: created/updated by guest checkout (no auth), admin-only read ----------
+       This mirrors the storefront's guest-checkout model (no customer accounts),
+       so writes can't be tied to a signed-in customer. Field-level validation
+       keeps this reasonably safe; for stronger guarantees, move this write to a
+       Cloud Function once you're ready for a paid (Blaze) plan. */
+    match /customers/{customerId} {
+      allow read: if isAdmin();
+      allow create, update: if
+        isNonEmptyString(request.resource.data.name, 80) &&
+        isNonEmptyString(request.resource.data.phone, 30);
+      allow delete: if isAdmin();
+    }
+  }
+}
